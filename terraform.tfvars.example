@@ -1,0 +1,27 @@
+# Copy this file to terraform.tfvars and fill in your values
+
+# Google Cloud Project Configuration
+project_id = "your-gcp-project-id"
+project_name = "meddataflow"
+region = "us-central1"
+zone = "us-central1-a"
+
+# Domain Configuration
+domain_name = "meddataflow.com"
+
+# Database Configuration
+database_name = "meddataflow"
+database_user = "meddataflow_user"
+database_password = "your-secure-database-password"
+db_instance_type = "db-f1-micro"  # For dev, use db-n1-standard-1 for production
+
+# Environment
+environment = "dev"
+
+# Security
+# Generate a strong key: openssl rand -hex 64
+jwt_secret_key = "CHANGE_ME_$(openssl rand -hex 64)"
+
+# Container Image Tags (optional)
+backend_image_tag = "latest"
+frontend_image_tag = "latest"
