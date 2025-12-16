@@ -67,6 +67,12 @@ variable "jwt_secret_key" {
   sensitive   = true
 }
 
+variable "waf_sqli_bypass_path_regex" {
+  description = "Regex for request.path to skip Cloud Armor SQLi inspection (use only for endpoints that legitimately carry SQL/code)."
+  type        = string
+  default     = "^/api/auth"
+}
+
 # Container image tags
 variable "backend_image_tag" {
   description = "Backend container image tag"

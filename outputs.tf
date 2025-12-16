@@ -32,13 +32,6 @@ output "database_private_ip" {
   sensitive   = true
 }
 
-output "database_connection_string" {
-  description = "Database connection string"
-  # URL-encode credentials in output as well, to reflect the actual env used by Cloud Run
-  value       = "postgresql://${urlencode(var.database_user)}:${urlencode(var.database_password)}@${google_sql_database_instance.meddataflow_postgres.private_ip_address}:5432/${var.database_name}"
-  sensitive   = true
-}
-
 # Cloud Run service outputs
 output "backend_service_url" {
   description = "Backend Cloud Run service URL"

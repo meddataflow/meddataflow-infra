@@ -1,5 +1,6 @@
 # Configure Terraform and Google Cloud provider
 terraform {
+  backend "gcs" {}
   required_version = ">= 1.0"
   required_providers {
     google = {
@@ -38,7 +39,7 @@ resource "google_project_service" "required_apis" {
 
 # Wait for APIs to be fully activated
 resource "time_sleep" "wait_for_apis" {
-  depends_on = [time_sleep.wait_for_apis]
+  depends_on = [google_project_service.required_apis]
   create_duration = "60s"
 }
 
@@ -84,7 +85,7 @@ resource "google_sql_database_instance" "meddataflow_postgres" {
   name             = "${var.project_name}-postgres"
   database_version = "POSTGRES_15"
   region           = var.region
-  deletion_protection = false
+  deletion_protection = true
 
   settings {
     tier = var.db_instance_type
@@ -145,6 +146,12 @@ resource "google_sql_user" "meddataflow_user" {
 resource "google_cloud_run_service" "meddataflow_backend" {
   name     = "${var.project_name}-backend"
   location = var.region
+
+  metadata {
+    annotations = {
+      "run.googleapis.com/ingress" = "internal-and-cloud-load-balancing"
+    }
+  }
 
   template {
     metadata {
@@ -209,6 +216,12 @@ resource "google_cloud_run_service" "meddataflow_frontend" {
   name     = "${var.project_name}-frontend"
   location = var.region
 
+  metadata {
+    annotations = {
+      "run.googleapis.com/ingress" = "internal-and-cloud-load-balancing"
+    }
+  }
+
   template {
     metadata {
       annotations = {
@@ -226,7 +239,7 @@ resource "google_cloud_run_service" "meddataflow_frontend" {
 
         env {
           name  = "NEXT_PUBLIC_API_URL"
-          value = google_cloud_run_service.meddataflow_backend.status[0].url
+          value = "https://${var.domain_name}"
         }
 
         resources {
@@ -236,6 +249,8 @@ resource "google_cloud_run_service" "meddataflow_frontend" {
           }
         }
       }
+
+      service_account_name = google_service_account.meddataflow_frontend_sa.email
     }
   }
 
@@ -263,6 +278,42 @@ resource "google_project_iam_member" "backend_sql_client" {
   project = var.project_id
   role    = "roles/cloudsql.client"
   member  = "serviceAccount:${google_service_account.meddataflow_backend_sa.email}"
+}
+
+resource "google_project_iam_member" "backend_artifact_registry_reader" {
+  project = var.project_id
+  role    = "roles/artifactregistry.reader"
+  member  = "serviceAccount:${google_service_account.meddataflow_backend_sa.email}"
+}
+
+resource "google_project_iam_member" "frontend_artifact_registry_reader" {
+  project = var.project_id
+  role    = "roles/artifactregistry.reader"
+  member  = "serviceAccount:${google_service_account.meddataflow_frontend_sa.email}"
+}
+
+resource "google_project_iam_member" "backend_logging" {
+  project = var.project_id
+  role    = "roles/logging.logWriter"
+  member  = "serviceAccount:${google_service_account.meddataflow_backend_sa.email}"
+}
+
+resource "google_project_iam_member" "frontend_logging" {
+  project = var.project_id
+  role    = "roles/logging.logWriter"
+  member  = "serviceAccount:${google_service_account.meddataflow_frontend_sa.email}"
+}
+
+resource "google_project_iam_member" "backend_monitoring" {
+  project = var.project_id
+  role    = "roles/monitoring.metricWriter"
+  member  = "serviceAccount:${google_service_account.meddataflow_backend_sa.email}"
+}
+
+resource "google_project_iam_member" "frontend_monitoring" {
+  project = var.project_id
+  role    = "roles/monitoring.metricWriter"
+  member  = "serviceAccount:${google_service_account.meddataflow_frontend_sa.email}"
 }
 
 # Allow public access to Cloud Run services (we'll restrict via Load Balancer)
@@ -319,10 +370,106 @@ resource "google_compute_region_network_endpoint_group" "frontend_neg" {
   }
 }
 
+# Cloud Armor security policy to provide baseline WAF protections
+resource "google_compute_security_policy" "meddataflow_waf" {
+  name = "${var.project_name}-waf"
+
+  # Rule 1: Allow authentication endpoints (highest priority)
+  rule {
+    action      = "allow"
+    description = "Allow authentication endpoints"
+    priority    = 100
+
+    match {
+      expr {
+        expression = "request.path.startsWith('/api/auth/') || request.path == '/api/auth'"
+      }
+    }
+  }
+
+  # Rule 2: Allow vendor ingestion endpoints
+  rule {
+    action      = "allow"
+    description = "Allow vendor message ingestion endpoints"
+    priority    = 110
+
+    match {
+      expr {
+        expression = "request.path.startsWith('/api/vendor/')"
+      }
+    }
+  }
+
+  # Rule 3: Allow workflow import endpoints
+  rule {
+    action      = "allow"
+    description = "Allow workflow import endpoints"
+    priority    = 120
+
+    match {
+      expr {
+        expression = "request.path.startsWith('/api/workflows/import')"
+      }
+    }
+  }
+
+  # Rule 2: Block SQL injection attempts (lower priority)
+  rule {
+    action      = "deny(403)"
+    description = "Block basic SQL injection attempts"
+    priority    = 1000
+
+    match {
+      expr {
+        # Keep SQLi protection on non-bypass paths; lower sensitivity and opt out noisy rule 942200.
+        expression = <<-EOT
+!request.path.matches('${var.waf_sqli_bypass_path_regex}') &&
+evaluatePreconfiguredWaf('sqli-v33-stable', {
+  'sensitivity': 1,
+  'opt_out_rule_ids': ['owasp-crs-v030301-id942200-sqli']
+})
+EOT
+      }
+    }
+  }
+
+  # Rule 3: Block XSS attempts
+  rule {
+    action      = "deny(403)"
+    description = "Block basic cross-site scripting attempts"
+    priority    = 1010
+
+    match {
+      expr {
+        expression = "evaluatePreconfiguredWaf('xss-v33-stable')"
+      }
+    }
+  }
+
+  # Rule 4: Default allow rule (lowest priority)
+  rule {
+    action   = "allow"
+    priority = 2147483647
+
+    match {
+      versioned_expr = "SRC_IPS_V1"
+      config {
+        src_ip_ranges = ["*"]
+      }
+    }
+  }
+}
+
 # Backend services
 resource "google_compute_backend_service" "backend_service" {
   name                            = "${var.project_name}-backend-service"
   connection_draining_timeout_sec = 10
+  security_policy                 = google_compute_security_policy.meddataflow_waf.id
+
+  log_config {
+    enable      = true
+    sample_rate = 1.0
+  }
 
   backend {
     group = google_compute_region_network_endpoint_group.backend_neg.id
@@ -332,6 +479,12 @@ resource "google_compute_backend_service" "backend_service" {
 resource "google_compute_backend_service" "frontend_service" {
   name                            = "${var.project_name}-frontend-service"
   connection_draining_timeout_sec = 10
+  security_policy                 = google_compute_security_policy.meddataflow_waf.id
+
+  log_config {
+    enable      = true
+    sample_rate = 1.0
+  }
 
   backend {
     group = google_compute_region_network_endpoint_group.frontend_neg.id
@@ -359,6 +512,12 @@ resource "google_compute_url_map" "meddataflow_url_map" {
 
     path_rule {
       paths   = ["/docs/*"]
+      service = google_compute_backend_service.backend_service.id
+    }
+
+    # Serve backend static assets (e.g., branding uploads) through the main domain
+    path_rule {
+      paths   = ["/static/*"]
       service = google_compute_backend_service.backend_service.id
     }
   }
