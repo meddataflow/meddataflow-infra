@@ -400,11 +400,24 @@ resource "google_compute_security_policy" "meddataflow_waf" {
     }
   }
 
+  # Rule 3: Allow platform settings uploads (branding, favicon, logos)
+  rule {
+    action      = "allow"
+    description = "Allow platform settings uploads"
+    priority    = 120
+
+    match {
+      expr {
+        expression = "request.path.startsWith('/api/settings/') || request.path == '/api/settings/platform-logo' || request.path == '/api/settings/platform-favicon'"
+      }
+    }
+  }
+
   # Rule 3: Allow workflow import endpoints
   rule {
     action      = "allow"
     description = "Allow workflow import endpoints"
-    priority    = 120
+    priority    = 130
 
     match {
       expr {
